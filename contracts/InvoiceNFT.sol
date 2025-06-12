@@ -7,6 +7,7 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
 import {FunctionsClient} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/FunctionsClient.sol";
 import {FunctionsRequest} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {PriceOracle} from "./PriceOracle.sol";
 
 contract InvoiceNFT is ERC721, FunctionsClient {
     error InvoiceNFT__NotFunctionsRouter();
@@ -34,6 +35,7 @@ contract InvoiceNFT is ERC721, FunctionsClient {
 
     // Pricefeed for USDC/USD
     AggregatorV3Interface internal immutable i_priceFeed;
+    PriceOracle internal immutable i_priceOracle;
 
     // Counter for invoice IDs
     uint256 private invoiceIdCounter;
@@ -106,7 +108,10 @@ contract InvoiceNFT is ERC721, FunctionsClient {
         requestToInvoiceId[requestId] = invoiceId;
     }
 
-    function fulfillVerification(uint256 invoiceId, bool isPaid) external {
+    function fulfillVerification(
+        uint256 invoiceId,
+        bool isPaid
+    ) external onlyFunctionsRouter {
         invoices[invoiceId].isPaid = isPaid;
     }
 
@@ -120,5 +125,12 @@ contract InvoiceNFT is ERC721, FunctionsClient {
         if (isPaid) {
             invoices[invoiceId].isPaid = true;
         }
+    }
+
+    function getInvoiceValueInUsd(
+        uint256 invoiceId
+    ) external view returns (uint256) {
+        uint256 amountInUsdc = invoices[invoiceId].amount;
+        return i_priceOracle.convertoUsd(amountInUsdc);
     }
 }
