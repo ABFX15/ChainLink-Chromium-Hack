@@ -133,4 +133,8 @@ contract InvoiceNFT is ERC721, FunctionsClient {
         uint256 amountInUsdc = invoices[invoiceId].amount;
         return i_priceOracle.convertoUsd(amountInUsdc);
     }
+
+    function getInvoice(uint256 invoiceId) external view returns (Invoice memory) {
+        return invoices[invoiceId];
+    }
 }
