@@ -6,32 +6,40 @@ import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {FunctionsClient} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/FunctionsClient.sol";
 import {FunctionsRequest} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
+import {IVRFv2Consumer} from "@chainlink/contracts/src/v0.8/vrf/v2/interfaces/IVRFv2Consumer.sol";
+import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AutomationCompatibleInterface.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {PriceOracle} from "./PriceOracle.sol";
 
-contract InvoiceNFT is ERC721, FunctionsClient {
+contract InvoiceNFT is ERC721, FunctionsClient, AutomationCompatibleInterface {
+    /*//////////////////////////////////////////////////////////////
+                               ERRORS
+    //////////////////////////////////////////////////////////////*/
     error InvoiceNFT__NotFunctionsRouter();
     error InvoiceNFT__NotVerified();
+    error InvoiceNFT__NotOwner();
 
     using FunctionsRequest for FunctionsRequest.Request;
+
+    /*//////////////////////////////////////////////////////////////
+                               STRUCTS
+    //////////////////////////////////////////////////////////////*/
     // Struct for invoice
     struct Invoice {
         uint256 amount; // Amount of the invoice
         uint256 dueDate; // Due date of the invoice
         address payer; // Address of the payer
         bool isPaid; // Whether the invoice is paid
+        bool isListed; // Whether the invoice is listed for sale
     }
 
+    /*//////////////////////////////////////////////////////////////
+                               STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
     // Mapping of invoice ID to invoice
-    mapping(uint256 invoiceId => Invoice) public invoices; // Mapping of invoice ID to invoice
-
-    // Event for when an invoice is minted
-    event InvoiceMinted(
-        uint256 indexed invoiceId,
-        uint256 indexed amount,
-        uint256 dueDate,
-        address payer
-    );
+    mapping(uint256 invoiceId => Invoice) public invoices; 
+    // Mapping of request ID to invoice ID
+    mapping(bytes32 => uint256) private requestToInvoiceId;
 
     // Pricefeed for USDC/USD
     AggregatorV3Interface internal immutable i_priceFeed;
@@ -40,8 +48,21 @@ contract InvoiceNFT is ERC721, FunctionsClient {
     // Counter for invoice IDs
     uint256 private invoiceIdCounter;
     uint64 private s_subscriptionId;
-    mapping(bytes32 => uint256) private requestToInvoiceId;
+    
+    /*//////////////////////////////////////////////////////////////
+                               EVENTS
+    //////////////////////////////////////////////////////////////*/
+    // Event for when an invoice is minted
+    event InvoiceMinted(
+        uint256 indexed invoiceId,
+        uint256 indexed amount,
+        uint256 dueDate,
+        address payer
+    );
 
+    /*//////////////////////////////////////////////////////////////
+                               MODIFIERS
+    //////////////////////////////////////////////////////////////*/
     modifier onlyFunctionsRouter() {
         if (msg.sender != address(i_router)) {
             revert InvoiceNFT__NotFunctionsRouter();
@@ -56,15 +77,18 @@ contract InvoiceNFT is ERC721, FunctionsClient {
         _;
     }
 
-    // Constructor
     constructor(
         address _priceFeed,
         address _functionsRouter
     ) ERC721("InvoiceNFT", "INV") FunctionsClient(_functionsRouter) {
         i_priceFeed = AggregatorV3Interface(_priceFeed);
         invoiceIdCounter = 1;
+        i_priceOracle = new PriceOracle(_priceFeed);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                               EXTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
     function mintInvoice(
         uint256 amount,
         uint256 dueDate,
@@ -115,6 +139,50 @@ contract InvoiceNFT is ERC721, FunctionsClient {
         invoices[invoiceId].isPaid = isPaid;
     }
 
+    
+    /*//////////////////////////////////////////////////////////////
+                            AUTOMATION
+    //////////////////////////////////////////////////////////////*/
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeeded, bytes memory) {
+        // TODO: Implement checkUpkeep
+    }    
+    
+    function performUpkeep(bytes calldata) external override {
+        // TODO: Implement performUpkeep
+        // Apply late penalities or notify  
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                  VRF
+    //////////////////////////////////////////////////////////////*/
+    function requestAuditor(uint256 invoiceId) external {
+        // TODO: Implement requestAuditor
+    }
+
+    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
+        // TODO: Implement fulfillRandomWords
+        // Assign Auditor 
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         MARKETPLACE FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+    function listForSale(uint256 invoiceId, uint256 price) external {
+        if (ownerOf(invoiceId) != msg.sender) {
+            revert InvoiceNFT__NotOwner();
+        }
+        invoices[invoiceId].isListed = true;
+    }
+
+    function buyWithUSDC(uint256 invoiceId) external {
+        // TODO: Implement buyWithUSDC
+        // transfer USDC from buyer to seller
+        // transfer nft to buyer
+    }
+    
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
     function fulfillRequest(
         bytes32 requestId,
         bytes memory response,
@@ -126,7 +194,9 @@ contract InvoiceNFT is ERC721, FunctionsClient {
             invoices[invoiceId].isPaid = true;
         }
     }
-
+    /*//////////////////////////////////////////////////////////////
+                            VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
     function getInvoiceValueInUsd(
         uint256 invoiceId
     ) external view returns (uint256) {
