@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
@@ -12,6 +13,7 @@ import {FunctionsRequest} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/l
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
 import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
+import {IAutomationRegistryConsumer} from "@chainlink/contracts/src/v0.8/automation/interfaces/IAutomationRegistryConsumer.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {PriceOracle} from "./PriceOracle.sol";
 
@@ -28,6 +30,8 @@ contract InvoiceNFT is
     Ownable,
     ReentrancyGuard
 {
+    using SafeERC20 for IERC20;
+
     /*//////////////////////////////////////////////////////////////
                                ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -36,12 +40,18 @@ contract InvoiceNFT is
     error InvoiceNFT__NotOwner();
     error InvoiceNFT__InvalidAmount();
     error InvoiceNFT__NotListed();
+    error InvoiceNFT__InvalidPayer();
     error InvoiceNFT__InvalidPriceFeed();
     error InvoiceNFT__InvalidFunctionsRouter();
     error InvoiceNFT__InvalidVRFCoordinator();
     error InvoiceNFT__NotPayer();
     error InvoiceNFT__StalePriceFeed();
     error InvoiceNFT__InvalidDueDate();
+    error InvoiceNFT__InvalidUSDC();
+    error InvoiceNFT__InvalidInvoice();
+    error InvoiceNFT__AlreadyVerified();
+    error InvoiceNFT__NotAutomationContract();
+    error InvoiceNFT__InvalidAutomationRegistry();
 
     using FunctionsRequest for FunctionsRequest.Request;
 
@@ -65,27 +75,36 @@ contract InvoiceNFT is
     /*//////////////////////////////////////////////////////////////
                                STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
-    mapping(uint256 invoiceId => Invoice) public invoices; // Mapping of invoice ID to invoice
+    mapping(uint256 invoiceId => Invoice) public invoices;
     mapping(bytes32 => uint256) private requestToInvoiceId;
+    mapping(uint256 => bool) private s_processedInvoices;
 
-    AggregatorV3Interface internal immutable i_priceFeed; // Pricefeed for USDC/USD
-    PriceOracle internal immutable i_priceOracle; // PriceOracle for USDC/USD conversions
+    bytes32 private s_activeInvoicesRoot;
+    mapping(uint256 => bool) private s_invoiceIsActive;
+    mapping(uint256 => bytes32) private s_invoiceLeaves;
 
-    uint256 private invoiceIdCounter; // Counter for invoice IDs
-    uint64 private s_subscriptionId; // Chainlink subscription ID
+    AggregatorV3Interface internal immutable i_priceFeed;
+    PriceOracle internal immutable i_priceOracle;
+    IAutomationRegistryConsumer internal immutable i_automationRegistry;
 
-    uint256 private constant FEE_PERCENTAGE = 50; // 0.5% fee
-    uint256 private constant PRECISION = 10000; // 100%
+    uint256 private invoiceIdCounter;
+    uint64 private immutable i_subscriptionId;
+    uint256 private s_lastCheck;
+    uint256 private s_lastProcessedId;
 
-    // Add VRF related state variables
+    uint256 private constant FEE_PERCENTAGE = 50;
+    uint256 private constant PRECISION = 10000;
+    uint256 private constant BATCH_SIZE = 10;
+    uint256 private constant MAX_DUE_DATE = 365 days; // Maximum due date from now
+
+    // VRF related state variables
     VRFCoordinatorV2Interface private immutable i_vrfCoordinator;
     bytes32 private immutable i_gasLane;
-    uint64 private immutable i_subscriptionId;
     uint32 private immutable i_callbackGasLimit;
-    uint16 private constant REQUEST_CONFIRMATIONS = 3;
-    uint32 private constant NUM_WORDS = 1;
+    // uint16 private constant REQUEST_CONFIRMATIONS = 3;
+    // uint32 private constant NUM_WORDS = 1;
 
-    // Add USDC interface
+    // USDC interface
     IERC20 public immutable USDC;
 
     /*//////////////////////////////////////////////////////////////
@@ -103,6 +122,11 @@ contract InvoiceNFT is
         address payer
     );
 
+    /// @notice Emitted when an invoice is processed
+    /// @param invoiceId The ID of the processed invoice
+    /// @param isPaid Whether the invoice was paid
+    event InvoiceProcessed(uint256 indexed invoiceId, bool isPaid);
+
     /// @notice Emitted when an invoice is listed for sale
     /// @param invoiceId The ID of the listed invoice
     /// @param amount The amount of the invoice
@@ -111,6 +135,11 @@ contract InvoiceNFT is
     /// @notice Emitted when an invoice is canceled
     /// @param invoiceId The ID of the canceled invoice
     event InvoiceCanceled(uint256 indexed invoiceId);
+
+    /// @notice Emitted when an invoice is due
+    /// @param invoiceId The ID of the due invoice
+    /// @param dueDate The due date of the invoice
+    event InvoiceDue(uint256 indexed invoiceId, uint256 dueDate);
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -129,6 +158,13 @@ contract InvoiceNFT is
         _;
     }
 
+    modifier onlyAutomation() {
+        if (msg.sender != address(i_automationRegistry)) {
+            revert InvoiceNFT__NotAutomationContract();
+        }
+        _;
+    }
+
     /// @notice Initializes the contract with required addresses and parameters
     /// @param _priceFeed Address of the Chainlink price feed
     /// @param _functionsRouter Address of the Chainlink Functions router
@@ -137,6 +173,7 @@ contract InvoiceNFT is
     /// @param _subscriptionId The Chainlink subscription ID
     /// @param _callbackGasLimit Gas limit for the callback
     /// @param _usdc Address of the USDC token
+    /// @param _automationRegistry Address of the Automation Registry
     constructor(
         address _priceFeed,
         address _functionsRouter,
@@ -144,30 +181,34 @@ contract InvoiceNFT is
         bytes32 _gasLane,
         uint64 _subscriptionId,
         uint32 _callbackGasLimit,
-        address _usdc
+        address _usdc,
+        address _automationRegistry
     )
         ERC721("InvoiceNFT", "INV")
         FunctionsClient(_functionsRouter)
         VRFConsumerBaseV2(_vrfCoordinator)
         Ownable(msg.sender)
     {
-        if (_priceFeed == address(0)) {
-            revert InvoiceNFT__InvalidPriceFeed();
-        }
-        if (_functionsRouter == address(0)) {
+        if (_priceFeed == address(0)) revert InvoiceNFT__InvalidPriceFeed();
+        if (_functionsRouter == address(0))
             revert InvoiceNFT__InvalidFunctionsRouter();
-        }
-        if (_vrfCoordinator == address(0)) {
+        if (_vrfCoordinator == address(0))
             revert InvoiceNFT__InvalidVRFCoordinator();
-        }
+        if (_usdc == address(0)) revert InvoiceNFT__InvalidUSDC();
+        if (_automationRegistry == address(0))
+            revert InvoiceNFT__InvalidAutomationRegistry();
+
         i_priceFeed = AggregatorV3Interface(_priceFeed);
-        invoiceIdCounter = 1;
         i_priceOracle = new PriceOracle(_priceFeed);
         i_vrfCoordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
+        i_automationRegistry = IAutomationRegistryConsumer(_automationRegistry);
         i_gasLane = _gasLane;
         i_subscriptionId = _subscriptionId;
         i_callbackGasLimit = _callbackGasLimit;
         USDC = IERC20(_usdc);
+
+        invoiceIdCounter = 1;
+        s_lastCheck = block.timestamp;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -184,14 +225,14 @@ contract InvoiceNFT is
         uint256 dueDate,
         address payer
     ) external nonReentrant {
-        uint256 invoiceId = invoiceIdCounter;
-        invoiceIdCounter++;
-        if (amount == 0) {
-            revert InvoiceNFT__InvalidAmount();
-        }
-        if (dueDate <= block.timestamp) {
+        if (amount == 0) revert InvoiceNFT__InvalidAmount();
+        if (dueDate <= block.timestamp) revert InvoiceNFT__InvalidDueDate();
+        if (dueDate > block.timestamp + MAX_DUE_DATE)
             revert InvoiceNFT__InvalidDueDate();
-        }
+        if (payer == address(0)) revert InvoiceNFT__InvalidPayer();
+
+        uint256 invoiceId = invoiceIdCounter++;
+
         invoices[invoiceId] = Invoice({
             amount: amount,
             dueDate: dueDate,
@@ -200,10 +241,13 @@ contract InvoiceNFT is
             isListed: false
         });
 
+        s_invoiceIsActive[invoiceId] = true;
+
         _safeMint(msg.sender, invoiceId);
         approve(payer, invoiceId);
 
         emit InvoiceMinted(invoiceId, amount, dueDate, payer);
+        emit InvoiceDue(invoiceId, dueDate);
     }
 
     /// @notice Initiates payment verification for an invoice
@@ -211,12 +255,18 @@ contract InvoiceNFT is
     /// @dev Uses Chainlink Functions to verify payment status
     /// @dev Stores request ID for callback handling
     function verifyInvoicePayment(uint256 invoiceId) external nonReentrant {
+        if (invoiceId >= invoiceIdCounter) revert InvoiceNFT__InvalidInvoice();
+        if (s_processedInvoices[invoiceId])
+            revert InvoiceNFT__AlreadyVerified();
+
         Invoice memory invoice = invoices[invoiceId];
+        if (invoice.isPaid) revert InvoiceNFT__AlreadyVerified();
 
         FunctionsRequest.Request memory req;
         req.initializeRequestForInlineJavaScript(
             "const invoiceId = args[0];\nconst amount = args[1];\nconst payer = args[2];\n\nconst response = await Functions.makeHttpRequest({\n    url: 'https://api.chainlink.com/v1/payments/verify',\n    method: 'POST',\n    headers: {\n        'Content-Type': 'application/json'\n    },\n    data: {\n        invoiceId: invoiceId,\n        amount: amount,\n        payer: payer\n    }\n});\nreturn Functions.encodeBool(response.data.isPaid);"
         );
+
         string[] memory args = new string[](3);
         args[0] = Strings.toString(invoiceId);
         args[1] = Strings.toString(invoice.amount);
@@ -225,12 +275,13 @@ contract InvoiceNFT is
 
         bytes32 requestId = _sendRequest(
             req.encodeCBOR(),
-            s_subscriptionId,
-            3000000, // gas limit
-            bytes32(0) // don hosted secrets slot id
+            i_subscriptionId,
+            3000000,
+            bytes32(0)
         );
 
         requestToInvoiceId[requestId] = invoiceId;
+        s_processedInvoices[invoiceId] = true;
     }
 
     /// @notice Updates invoice payment status
@@ -248,7 +299,7 @@ contract InvoiceNFT is
     /*//////////////////////////////////////////////////////////////
                             AUTOMATION
     //////////////////////////////////////////////////////////////*/
-    /// @notice Checks if any invoices need automated attention
+    /// @notice Checks for any invoice payments over the last 24 hours
     /// @param checkData Additional data for the check (unused)
     /// @return upkeepNeeded Whether any invoices need attention
     /// @return performData Data needed for the upkeep
@@ -261,15 +312,18 @@ contract InvoiceNFT is
         override
         returns (bool upkeepNeeded, bytes memory performData)
     {
-        // TODO: Implement checkUpkeep
+        upkeepNeeded = (block.timestamp >= s_lastCheck + 24 hours);
     }
 
     /// @notice Performs automated actions on invoices
     /// @param performData Data needed for the upkeep
     /// @dev Part of Chainlink Automation
     /// @dev Handles late payments and notifications
-    function performUpkeep(bytes calldata performData) external override {
-        // TODO: Implement performUpkeep
+    function performUpkeep(
+        bytes calldata performData
+    ) external override onlyAutomation {
+        s_lastCheck = block.timestamp;
+        _checkInvoicePayments();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -304,6 +358,8 @@ contract InvoiceNFT is
         if (ownerOf(invoiceId) != msg.sender) {
             revert InvoiceNFT__NotOwner();
         }
+        invoices[invoiceId].isListed = true;
+
         (
             uint80 roundId,
             int256 price,
@@ -316,8 +372,6 @@ contract InvoiceNFT is
         if (updatedAt == 0) revert InvoiceNFT__StalePriceFeed();
         if (answeredInRound < roundId) revert InvoiceNFT__StalePriceFeed();
 
-        invoices[invoiceId].isListed = true;
-
         emit InvoiceListed(invoiceId, invoices[invoiceId].amount);
     }
 
@@ -326,16 +380,21 @@ contract InvoiceNFT is
     /// @dev Transfers USDC from buyer to seller and protocol
     /// @dev Transfers NFT ownership to buyer
     function buyWithUSDC(uint256 invoiceId) external nonReentrant {
-        if (!invoices[invoiceId].isListed) {
-            revert InvoiceNFT__NotListed();
-        }
-        uint256 amount = invoices[invoiceId].amount;
+        if (invoiceId >= invoiceIdCounter) revert InvoiceNFT__InvalidInvoice();
+
+        Invoice memory invoice = invoices[invoiceId];
+        if (!invoice.isListed) revert InvoiceNFT__NotListed();
+
+        uint256 amount = invoice.amount;
         uint256 fee = (amount * FEE_PERCENTAGE) / PRECISION;
+        uint256 sellerAmount = amount - fee;
 
-        USDC.transferFrom(msg.sender, owner(), fee); // protocol fee
-        USDC.transferFrom(msg.sender, invoices[invoiceId].payer, amount - fee); //  seller payout
+        invoices[invoiceId].isListed = false;
 
-        _transfer(owner(), msg.sender, invoiceId);
+        USDC.safeTransferFrom(msg.sender, owner(), fee);
+        USDC.safeTransferFrom(msg.sender, invoice.payer, sellerAmount);
+
+        _transfer(ownerOf(invoiceId), msg.sender, invoiceId);
     }
 
     function cancelListing(uint256 invoiceId) external nonReentrant {
@@ -366,6 +425,28 @@ contract InvoiceNFT is
         bool isPaid = abi.decode(response, (bool));
         if (isPaid) {
             invoices[invoiceId].isPaid = true;
+        }
+    }
+
+    function _checkInvoicePayments() internal {
+        uint256 endId = s_lastProcessedId + BATCH_SIZE;
+        if (endId > invoiceIdCounter) {
+            endId = invoiceIdCounter;
+        }
+
+        for (uint256 i = s_lastProcessedId + 1; i <= endId; i++) {
+            if (s_invoiceIsActive[i]) {
+                Invoice memory invoice = invoices[i];
+                if (invoice.isPaid && invoice.dueDate < block.timestamp) {
+                    s_invoiceIsActive[i] = false;
+                    emit InvoiceProcessed(i, true);
+                }
+            }
+        }
+
+        s_lastProcessedId = endId;
+        if (s_lastProcessedId >= invoiceIdCounter) {
+            s_lastProcessedId = 0; 
         }
     }
 
